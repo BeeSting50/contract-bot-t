@@ -49,11 +49,6 @@ API_ENDPOINTS = {
 }
 HTTP_URLS = API_ENDPOINTS[NETWORK]
 
-# Test mode - if all endpoints fail, we'll simulate some activity
-TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
-CONTRACT = "farmforhoney"
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))  # seconds between polls
-
 # Track last seen transaction to avoid duplicates
 last_seen_timestamp = None
 processed_transactions = set()
@@ -410,40 +405,6 @@ async def check_logtransfer_actions(session, api_url, channel):
                             
     except Exception as e:
         print(f"Error checking logtransfer actions: {e}")
-
-async def test_mode_simulation(channel):
-    """Simulate blockchain events for testing purposes"""
-    print("Test mode: Simulating setbeevar events every 30 seconds...")
-    counter = 1
-    
-    while True:
-        # Simulate a setbeevar action
-        fake_trace = {
-            "trx_id": f"test_transaction_{counter:04d}",
-            "@timestamp": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-        }
-        
-        fake_data = {
-            "type": "queen",
-            "rarity": "common",
-            "category": "earning",
-            "values": [4, 3, 2, 1]
-        }
-        
-        print(f"Simulating setbeevar action: {fake_data}")
-        
-        # Create embed using the new formatting
-        embed = create_embed_for_action(fake_trace, "setbeevar", fake_data, "[TEST MODE] 🐝 Bee Variables Updated")
-        embed.color = 0xff0000  # Red color to indicate test mode
-        
-        try:
-            await channel.send(embed=embed)
-            print(f"Test message {counter} sent to Discord")
-        except Exception as e:
-            print(f"Error sending test message: {e}")
-        
-        counter += 1
-        await asyncio.sleep(30)  # Wait 30 seconds between test messages
 
 # ------------------------------------------------------------------
 # 5.  Entry-point
