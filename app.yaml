@@ -1,0 +1,27 @@
+name: honeyfarms-contract-bot
+services:
+- name: bot
+  source_dir: /
+  github:
+    repo: your-username/contract-bot-t
+    branch: main
+  run_command: python3 bot.py
+  environment_slug: python
+  instance_count: 1
+  instance_size_slug: basic-xxs
+  envs:
+  - key: DISCORD_TOKEN
+    scope: RUN_TIME
+    type: SECRET
+  - key: CHANNEL_ID
+    scope: RUN_TIME
+    value: "1394168118795829339"
+  - key: CONTRACT_NAME
+    scope: RUN_TIME
+    value: "farmforhoney"
+  - key: NETWORK
+    scope: RUN_TIME
+    value: "testnet"
+  - key: POLL_INTERVAL
+    scope: RUN_TIME
+    value: "10"
