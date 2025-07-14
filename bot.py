@@ -57,6 +57,7 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))  # seconds between polls
 # Track last seen transaction to avoid duplicates
 last_seen_timestamp = None
 processed_transactions = set()
+bot_start_time = None
 
 # ------------------------------------------------------------------
 # 3.  Discord client
@@ -156,7 +157,7 @@ def create_embed_for_action(action, act_name, act_data, custom_title=None):
     return embed
 
 def create_transfer_embed(action, act_data):
-    """Create special embed for transfer actions (New Hive Staked)"""
+    """Create special embeds for transfer actions with specific memos"""
     memo = act_data.get('memo', '')
     
     if memo == "stakehive":
@@ -167,7 +168,7 @@ def create_transfer_embed(action, act_data):
         description_parts = [
             f"**Wallet:** `{act_data.get('from', 'Unknown')}`",
             "",
-            f"**Hive Asset ID:** `{asset_ids[0] if asset_ids else 'Unknown'}`"
+            f"**Asset IDs:** `{', '.join(asset_ids) if asset_ids else 'Unknown'}`"
         ]
         
         return create_custom_embed(
@@ -234,10 +235,19 @@ def embed_for(tx, act_name, data):
 # 4.  HTTP polling listener
 # ------------------------------------------------------------------
 async def http_listener():
-    global last_seen_timestamp, processed_transactions
+    global last_seen_timestamp, processed_transactions, bot_start_time
     
     await client.wait_until_ready()
     channel = client.get_channel(CID)
+    
+    # Set bot start time to prevent processing old actions
+    bot_start_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    print(f"Bot started at: {bot_start_time}")
+    
+    # Wait 10 seconds after startup to avoid processing old actions
+    print("Waiting 10 seconds to avoid processing old actions...")
+    await asyncio.sleep(10)
+    print("Starting to monitor for new actions...")
     
     current_url_index = 0
     consecutive_failures = 0
@@ -274,6 +284,11 @@ async def http_listener():
                             # Skip if we've already processed this transaction
                             if trx_id in processed_transactions:
                                 continue
+                            
+                            # Skip actions that occurred before bot started
+                            action_timestamp = action.get('@timestamp', action.get('timestamp', ''))
+                            if bot_start_time and action_timestamp < bot_start_time:
+                                continue
                                 
                             processed_transactions.add(trx_id)
                             
@@ -293,6 +308,12 @@ async def http_listener():
                                     embed = create_embed_for_action(action, act_name, act_data, "💰 Honey Claimed")
                                 elif act_name == 'unstake':
                                     embed = create_embed_for_action(action, act_name, act_data, "📤 Asset Unstaked")
+                                elif act_name == 'transfer':
+                                    # Try to create special transfer embed first
+                                    embed = create_transfer_embed(action, act_data)
+                                    if not embed:
+                                        # Fallback to generic transfer embed
+                                        embed = create_embed_for_action(action, act_name, act_data)
                                 else:
                                     embed = create_embed_for_action(action, act_name, act_data)
                                 
@@ -334,6 +355,7 @@ async def http_listener():
 
 async def check_logtransfer_actions(session, api_url, channel):
     """Check for atomicassets logtransfer actions to farmforhoney"""
+    global last_seen_timestamp
     try:
         params = {
             'account': 'atomicassets',
@@ -341,6 +363,10 @@ async def check_logtransfer_actions(session, api_url, channel):
             'limit': 10,
             'sort': 'desc'
         }
+        
+        # Only get transfers after the last seen timestamp to avoid spam on startup
+        if last_seen_timestamp:
+            params['after'] = last_seen_timestamp
         
         async with session.get(f"{api_url}/v2/history/get_actions", params=params, timeout=30) as response:
             if response.status == 200:
@@ -352,6 +378,11 @@ async def check_logtransfer_actions(session, api_url, channel):
                     
                     # Skip if already processed
                     if trx_id in processed_transactions:
+                        continue
+                    
+                    # Skip actions that occurred before bot started
+                    action_timestamp = action.get('@timestamp', action.get('timestamp', ''))
+                    if bot_start_time and action_timestamp < bot_start_time:
                         continue
                     
                     act_data = action['act']['data']
@@ -371,6 +402,11 @@ async def check_logtransfer_actions(session, api_url, channel):
                             print(f"Sent 'New Hive Staked' notification to Discord")
                         elif memo.startswith("stakebees:"):
                             print(f"Sent 'Bees Staked to Hive' notification to Discord")
+                    else:
+                        # Create a generic transfer embed as fallback
+                        generic_embed = create_embed_for_action(action, "transfer", act_data)
+                        await channel.send(embed=generic_embed)
+                        print(f"Sent generic transfer notification to Discord")
                             
     except Exception as e:
         print(f"Error checking logtransfer actions: {e}")
