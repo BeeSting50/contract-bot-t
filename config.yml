@@ -1,0 +1,11 @@
+# Discord Bot Configuration
+# Role-based permissions for bot commands
+
+permissions:
+  # Role ID that can execute the /clear command
+  # Replace with your actual role ID (right-click role in Discord > Copy ID)
+  clear_command_role_id: "1392648436041388032"
+  
+  # Role ID that can create and manage giveaways
+  # Uses the same role as clear_command for now, but can be changed
+  giveaway_role_id: "1392648436041388032"

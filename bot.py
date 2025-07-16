@@ -3,7 +3,10 @@ import asyncio
 import json
 import aiohttp
 import discord
-from datetime import datetime, timezone
+from discord.ext import commands, tasks
+import yaml
+from datetime import datetime, timezone, timedelta
+import random
 
 # ------------------------------------------------------------------
 # 1.  Environment sanity check
@@ -59,11 +62,33 @@ last_seen_timestamp = None
 processed_transactions = set()
 bot_start_time = None
 
+# Giveaway storage
+active_giveaways = {}  # {message_id: giveaway_data}
+giveaway_counter = 0
+
 # ------------------------------------------------------------------
-# 3.  Discord client
+# 3.  Load configuration
+# ------------------------------------------------------------------
+def load_config():
+    """Load configuration from config.yml"""
+    try:
+        with open('config.yml', 'r') as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        print("Warning: config.yml not found. Role-based commands will be disabled.")
+        return {}
+    except Exception as e:
+        print(f"Error loading config.yml: {e}")
+        return {}
+
+config = load_config()
+
+# ------------------------------------------------------------------
+# 4.  Discord client
 # ------------------------------------------------------------------
 intents = discord.Intents.default()
-client = discord.Client(intents=intents)
+intents.message_content = True  # Required for message content
+bot = commands.Bot(command_prefix='!', intents=intents)
 
 def create_embed_for_action(action, act_name, act_data, custom_title=None):
     """Create a nicely formatted Discord embed for blockchain actions"""
@@ -232,13 +257,411 @@ def embed_for(tx, act_name, data):
     return create_embed_for_action(tx, act_name, data)
 
 # ------------------------------------------------------------------
-# 4.  HTTP polling listener
+# 5.  Discord slash commands
+# ------------------------------------------------------------------
+@bot.tree.command(
+    name="clear",
+    description="Clear all messages in the current channel (requires specific role)"
+)
+async def clear_command(interaction: discord.Interaction):
+    """Slash command to clear all messages in the channel"""
+    try:
+        # Defer the response immediately to prevent timeout
+        await interaction.response.defer(ephemeral=True)
+        
+        # Check if user has the required role
+        required_role_id = config.get('permissions', {}).get('clear_command_role_id')
+        
+        if not required_role_id or required_role_id == "YOUR_ROLE_ID_HERE":
+            await interaction.followup.send("❌ Clear command is not configured. Please set the role ID in config.yml", ephemeral=True)
+            return
+        
+        # Check if user has the required role
+        user_role_ids = [str(role.id) for role in interaction.user.roles]
+        if required_role_id not in user_role_ids:
+            await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+        
+        # Delete all messages in the channel using purge (more efficient)
+        deleted = await interaction.channel.purge(limit=None)
+        
+        # Send confirmation message
+        embed = discord.Embed(
+            title="🧹 Channel Cleared",
+            description=f"Successfully deleted {len(deleted)} messages from this channel.",
+            color=0x00ff00
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except discord.Forbidden:
+        embed = discord.Embed(
+            title="❌ Permission Error",
+            description="I don't have permission to delete messages in this channel.",
+            color=0xff0000
+        )
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except:
+            # If followup fails, try original response (in case defer didn't work)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as e:
+        print(f"Error in clear command: {e}")
+        embed = discord.Embed(
+            title="❌ Error",
+            description=f"An error occurred while clearing the channel: {str(e)}",
+            color=0xff0000
+        )
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except:
+            # If followup fails, try original response (in case defer didn't work)
+            try:
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+            except:
+                pass  # Interaction already expired, but operation completed
+
+@bot.tree.command(
+    name="giveaway",
+    description="Create a new giveaway with a reward and duration"
+)
+async def giveaway_command(
+    interaction: discord.Interaction,
+    reward: str,
+    duration_minutes: int,
+    description: str = None
+):
+    """Slash command to create a giveaway"""
+    global giveaway_counter, active_giveaways
+    
+    try:
+        # Defer the response immediately to prevent timeout
+        await interaction.response.defer()
+        
+        # Check if user has the required role
+        required_role_id = config.get('permissions', {}).get('giveaway_role_id')
+        
+        if not required_role_id or required_role_id == "YOUR_ROLE_ID_HERE":
+            await interaction.followup.send("❌ Giveaway command is not configured. Please set the giveaway_role_id in config.yml", ephemeral=True)
+            return
+        
+        # Check if user has the required role
+        user_role_ids = [str(role.id) for role in interaction.user.roles]
+        if required_role_id not in user_role_ids:
+            await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+        
+        # Validate duration
+        if duration_minutes < 1 or duration_minutes > 10080:  # Max 1 week
+            await interaction.followup.send("❌ Duration must be between 1 minute and 1 week (10080 minutes).", ephemeral=True)
+            return
+        
+        # Calculate end time
+        end_time = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
+        
+        # Create giveaway embed
+        giveaway_counter += 1
+        
+        embed = discord.Embed(
+            title="🎉 GIVEAWAY 🎉",
+            description=f"**Reward:** {reward}\n\n{description or 'React with 🎉 to enter!'}",
+            color=0xFF6B6B,
+            timestamp=end_time
+        )
+        
+        embed.add_field(
+            name="⏰ Ends",
+            value=f"<t:{int(end_time.timestamp())}:R>",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="👥 Participants",
+            value="0",
+            inline=True
+        )
+        
+        embed.set_footer(text="Ends at")
+        
+        # Send the giveaway message
+        message = await interaction.followup.send(embed=embed)
+        
+        # Add reaction
+        await message.add_reaction("🎉")
+        
+        # Store giveaway data
+        active_giveaways[message.id] = {
+            'id': giveaway_counter,
+            'reward': reward,
+            'description': description,
+            'end_time': end_time,
+            'creator': interaction.user.id,
+            'channel_id': interaction.channel.id,
+            'participants': set(),
+            'ended': False
+        }
+        
+        print(f"Created giveaway #{giveaway_counter} ending at {end_time}")
+        
+    except Exception as e:
+        print(f"Error in giveaway command: {e}")
+        embed = discord.Embed(
+            title="❌ Error",
+            description=f"An error occurred while creating the giveaway: {str(e)}",
+            color=0xff0000
+        )
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except:
+            try:
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+            except:
+                pass
+
+@bot.tree.command(
+    name="end_giveaway",
+    description="Manually end a giveaway and pick a winner"
+)
+async def end_giveaway_command(
+    interaction: discord.Interaction,
+    message_id: str
+):
+    """Slash command to manually end a giveaway"""
+    try:
+        # Defer the response immediately to prevent timeout
+        await interaction.response.defer(ephemeral=True)
+        
+        # Check if user has the required role
+        required_role_id = config.get('permissions', {}).get('giveaway_role_id')
+        
+        if not required_role_id or required_role_id == "YOUR_ROLE_ID_HERE":
+            await interaction.followup.send("❌ End giveaway command is not configured. Please set the giveaway_role_id in config.yml", ephemeral=True)
+            return
+        
+        # Check if user has the required role
+        user_role_ids = [str(role.id) for role in interaction.user.roles]
+        if required_role_id not in user_role_ids:
+            await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+        
+        try:
+            msg_id = int(message_id)
+        except ValueError:
+            await interaction.followup.send("❌ Invalid message ID format.", ephemeral=True)
+            return
+        
+        if msg_id not in active_giveaways:
+            await interaction.followup.send("❌ Giveaway not found or already ended.", ephemeral=True)
+            return
+        
+        giveaway = active_giveaways[msg_id]
+        
+        # Check if user is the creator or has admin permissions
+        if giveaway['creator'] != interaction.user.id:
+            await interaction.followup.send("❌ You can only end giveaways you created.", ephemeral=True)
+            return
+        
+        # End the giveaway
+        await end_giveaway(msg_id)
+        await interaction.followup.send("✅ Giveaway ended successfully!", ephemeral=True)
+        
+    except Exception as e:
+        print(f"Error in end_giveaway command: {e}")
+        embed = discord.Embed(
+            title="❌ Error",
+            description=f"An error occurred while ending the giveaway: {str(e)}",
+            color=0xff0000
+        )
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except:
+             pass
+
+@bot.tree.command(
+    name="list_giveaways",
+    description="List all active giveaways"
+)
+async def list_giveaways_command(interaction: discord.Interaction):
+    """Slash command to list active giveaways"""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        if not active_giveaways:
+            await interaction.followup.send("📭 No active giveaways at the moment.", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title="🎉 Active Giveaways",
+            color=0xFF6B6B
+        )
+        
+        for message_id, giveaway in active_giveaways.items():
+            if not giveaway['ended']:
+                time_left = giveaway['end_time'] - datetime.now(timezone.utc)
+                if time_left.total_seconds() > 0:
+                    embed.add_field(
+                        name=f"Giveaway #{giveaway['id']}",
+                        value=f"**Reward:** {giveaway['reward']}\n**Participants:** {len(giveaway['participants'])}\n**Ends:** <t:{int(giveaway['end_time'].timestamp())}:R>\n**Message ID:** {message_id}",
+                        inline=False
+                    )
+        
+        if len(embed.fields) == 0:
+            await interaction.followup.send("📭 No active giveaways at the moment.", ephemeral=True)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        print(f"Error in list_giveaways command: {e}")
+        await interaction.followup.send("❌ An error occurred while listing giveaways.", ephemeral=True)
+ 
+ # ------------------------------------------------------------------
+ # 6.  Giveaway functions
+ # ------------------------------------------------------------------
+
+@bot.event
+async def on_reaction_add(reaction, user):
+    """Handle reaction additions for giveaways"""
+    # Ignore bot reactions
+    if user.bot:
+        return
+    
+    # Check if this is a giveaway message
+    if reaction.message.id in active_giveaways:
+        giveaway = active_giveaways[reaction.message.id]
+        
+        # Check if giveaway is still active
+        if giveaway['ended'] or datetime.now(timezone.utc) > giveaway['end_time']:
+            return
+        
+        # Check if reaction is the giveaway emoji
+        if str(reaction.emoji) == "🎉":
+            # Add user to participants
+            giveaway['participants'].add(user.id)
+            
+            # Update the embed with new participant count
+            await update_giveaway_embed(reaction.message, giveaway)
+
+@bot.event
+async def on_reaction_remove(reaction, user):
+    """Handle reaction removals for giveaways"""
+    # Ignore bot reactions
+    if user.bot:
+        return
+    
+    # Check if this is a giveaway message
+    if reaction.message.id in active_giveaways:
+        giveaway = active_giveaways[reaction.message.id]
+        
+        # Check if giveaway is still active
+        if giveaway['ended'] or datetime.now(timezone.utc) > giveaway['end_time']:
+            return
+        
+        # Check if reaction is the giveaway emoji
+        if str(reaction.emoji) == "🎉":
+            # Remove user from participants
+            giveaway['participants'].discard(user.id)
+            
+            # Update the embed with new participant count
+            await update_giveaway_embed(reaction.message, giveaway)
+
+async def update_giveaway_embed(message, giveaway):
+    """Update the giveaway embed with current participant count"""
+    try:
+        embed = message.embeds[0]
+        
+        # Update participant count field
+        for i, field in enumerate(embed.fields):
+            if field.name == "👥 Participants":
+                embed.set_field_at(i, name="👥 Participants", value=str(len(giveaway['participants'])), inline=True)
+                break
+        
+        await message.edit(embed=embed)
+    except Exception as e:
+        print(f"Error updating giveaway embed: {e}")
+
+async def end_giveaway(message_id):
+    """End a giveaway and pick a winner"""
+    if message_id not in active_giveaways:
+        return
+    
+    giveaway = active_giveaways[message_id]
+    giveaway['ended'] = True
+    
+    try:
+        # Get the channel and message
+        channel = bot.get_channel(giveaway['channel_id'])
+        if not channel:
+            print(f"Could not find channel {giveaway['channel_id']} for giveaway {giveaway['id']}")
+            return
+        
+        message = await channel.fetch_message(message_id)
+        if not message:
+            print(f"Could not find message {message_id} for giveaway {giveaway['id']}")
+            return
+        
+        # Pick a winner
+        participants = list(giveaway['participants'])
+        
+        if not participants:
+            # No participants
+            embed = discord.Embed(
+                title="🎉 GIVEAWAY ENDED 🎉",
+                description=f"**Reward:** {giveaway['reward']}\n\n❌ No participants! No winner selected.",
+                color=0x808080
+            )
+            embed.add_field(name="👥 Participants", value="0", inline=True)
+            embed.set_footer(text="Giveaway ended")
+            
+            await message.edit(embed=embed)
+            await channel.send("🎉 **Giveaway ended!** Unfortunately, no one participated. 😢")
+        else:
+            # Pick random winner
+            winner_id = random.choice(participants)
+            winner = bot.get_user(winner_id)
+            winner_mention = winner.mention if winner else f"<@{winner_id}>"
+            
+            # Update embed
+            embed = discord.Embed(
+                title="🎉 GIVEAWAY ENDED 🎉",
+                description=f"**Reward:** {giveaway['reward']}\n\n🏆 **Winner:** {winner_mention}",
+                color=0x00FF00
+            )
+            embed.add_field(name="👥 Participants", value=str(len(participants)), inline=True)
+            embed.add_field(name="🏆 Winner", value=winner_mention, inline=True)
+            embed.set_footer(text="Giveaway ended")
+            
+            await message.edit(embed=embed)
+            
+            # Announce winner
+            await channel.send(f"🎉 **Giveaway ended!** Congratulations {winner_mention}! You won: **{giveaway['reward']}** 🏆")
+        
+        # Remove from active giveaways
+        del active_giveaways[message_id]
+        print(f"Ended giveaway #{giveaway['id']}")
+        
+    except Exception as e:
+        print(f"Error ending giveaway {giveaway['id']}: {e}")
+
+@tasks.loop(minutes=1)
+async def check_giveaways():
+    """Check for expired giveaways every minute"""
+    current_time = datetime.now(timezone.utc)
+    expired_giveaways = []
+    
+    for message_id, giveaway in active_giveaways.items():
+        if not giveaway['ended'] and current_time >= giveaway['end_time']:
+            expired_giveaways.append(message_id)
+    
+    for message_id in expired_giveaways:
+        await end_giveaway(message_id)
+
+# ------------------------------------------------------------------
+# 7.  HTTP polling listener
 # ------------------------------------------------------------------
 async def http_listener():
     global last_seen_timestamp, processed_transactions, bot_start_time
     
-    await client.wait_until_ready()
-    channel = client.get_channel(CID)
+    await bot.wait_until_ready()
+    channel = bot.get_channel(CID)
     
     # Set bot start time to prevent processing old actions
     bot_start_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
@@ -412,25 +835,37 @@ async def check_logtransfer_actions(session, api_url, channel):
         print(f"Error checking logtransfer actions: {e}")
 
 # ------------------------------------------------------------------
-# 5.  Entry-point
+# 8.  Entry-point
 # ------------------------------------------------------------------
-@client.event
+@bot.event
 async def on_ready():
-    print(f"[{NETWORK}] Logged in as {client.user}")
+    print(f"[{NETWORK}] Logged in as {bot.user}")
     print(f"Monitoring contract: {CONTRACT}")
     print(f"Target channel ID: {CID}")
     print(f"Poll interval: {POLL_INTERVAL} seconds")
-    channel = client.get_channel(CID)
+    channel = bot.get_channel(CID)
     if channel:
         print(f"Found target channel: {channel.name}")
     else:
         print(f"WARNING: Could not find channel with ID {CID}")
+    
+    # Start giveaway checker
+    if not check_giveaways.is_running():
+        check_giveaways.start()
+        print("Started giveaway checker task")
+    
+    # Sync slash commands
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"Failed to sync commands: {e}")
 
 async def main():
     print(f"Starting Discord bot for {NETWORK} network...")
     print(f"Available HTTP API URLs: {HTTP_URLS}")
     await asyncio.gather(
-        client.start(TOKEN),
+        bot.start(TOKEN),
         http_listener()
     )
 
