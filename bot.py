@@ -21,6 +21,8 @@ if not TOKEN:
         pass
 
 CID     = int(os.getenv("CHANNEL_ID"))
+CONTRACT = os.getenv("CONTRACT")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 2)) # Default to 2 seconds
 NETWORK = os.getenv("NETWORK", "").lower()
 
 if NETWORK not in {"mainnet", "testnet"}:
@@ -28,6 +30,9 @@ if NETWORK not in {"mainnet", "testnet"}:
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN not found in environment variables")
+
+if not CONTRACT:
+    raise RuntimeError("CONTRACT not found in environment variables")
 
 # ------------------------------------------------------------------
 # 2.  HTTP API Endpoint map
