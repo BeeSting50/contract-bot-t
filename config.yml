@@ -9,3 +9,12 @@ permissions:
   # Role ID that can create and manage giveaways
   # Uses the same role as clear_command for now, but can be changed
   giveaway_role_id: "1392648436041388032"
+  
+  # Role ID that can reset invite data
+  invite_admin_role_id: "1392648436041388032"
+
+# Invite tracking configuration
+invite_tracking:
+  enabled: false  # Set to true after enabling privileged intents in Discord Developer Portal
+  invite_log_channel_id: "1234567890123456789"  # Channel ID for invite notifications
+  fake_account_threshold_days: 7  # Accounts younger than this are considered potentially fake

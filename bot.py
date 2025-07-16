@@ -66,6 +66,40 @@ bot_start_time = None
 active_giveaways = {}  # {message_id: giveaway_data}
 giveaway_counter = 0
 
+# Invite tracking storage
+invite_data = {}  # {user_id: {invites: int, joins: int, left: int, fake: int}}
+invite_cache = {}  # {invite_code: {inviter_id: int, uses: int}}
+guild_invites = {}  # Cache of guild invites
+
+# Load invite data from file
+def load_invite_data():
+    """Load invite data from JSON file"""
+    global invite_data
+    try:
+        with open('invite_data.json', 'r') as f:
+            invite_data = json.load(f)
+            # Convert string keys back to integers
+            invite_data = {int(k): v for k, v in invite_data.items()}
+        print(f"Loaded invite data for {len(invite_data)} users")
+    except FileNotFoundError:
+        print("No existing invite data file found, starting fresh")
+        invite_data = {}
+    except Exception as e:
+        print(f"Error loading invite data: {e}")
+        invite_data = {}
+
+def save_invite_data():
+    """Save invite data to JSON file"""
+    try:
+        with open('invite_data.json', 'w') as f:
+            json.dump(invite_data, f, indent=2)
+        print(f"Saved invite data for {len(invite_data)} users")
+    except Exception as e:
+        print(f"Error saving invite data: {e}")
+
+# Load invite data on startup
+load_invite_data()
+
 # ------------------------------------------------------------------
 # 3.  Load configuration
 # ------------------------------------------------------------------
@@ -88,6 +122,21 @@ config = load_config()
 # ------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True  # Required for message content
+
+# Try to enable privileged intents for invite tracking
+# These need to be enabled in Discord Developer Portal
+try:
+    invite_config = config.get('invite_tracking', {})
+    if invite_config.get('enabled', False):
+        print("Invite tracking is enabled, requesting privileged intents...")
+        print("Make sure to enable 'Server Members Intent' and 'Message Content Intent' in Discord Developer Portal")
+        intents.members = True  # Required for member events
+        intents.invites = True  # Required for invite tracking
+    else:
+        print("Invite tracking is disabled in config")
+except Exception as e:
+    print(f"Warning: Could not configure invite tracking intents: {e}")
+
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def create_embed_for_action(action, act_name, act_data, custom_title=None):
@@ -328,7 +377,8 @@ async def giveaway_command(
     interaction: discord.Interaction,
     reward: str,
     duration_minutes: int,
-    description: str = None
+    description: str = None,
+    required_role: discord.Role = None
 ):
     """Slash command to create a giveaway"""
     global giveaway_counter, active_giveaways
@@ -380,6 +430,13 @@ async def giveaway_command(
             inline=True
         )
         
+        if required_role:
+            embed.add_field(
+                name="🔒 Required Role",
+                value=required_role.mention,
+                inline=True
+            )
+        
         embed.set_footer(text="Ends at")
         
         # Send the giveaway message
@@ -397,7 +454,8 @@ async def giveaway_command(
             'creator': interaction.user.id,
             'channel_id': interaction.channel.id,
             'participants': set(),
-            'ended': False
+            'ended': False,
+            'required_role_id': required_role.id if required_role else None
         }
         
         print(f"Created giveaway #{giveaway_counter} ending at {end_time}")
@@ -498,9 +556,18 @@ async def list_giveaways_command(interaction: discord.Interaction):
             if not giveaway['ended']:
                 time_left = giveaway['end_time'] - datetime.now(timezone.utc)
                 if time_left.total_seconds() > 0:
+                    # Build giveaway info
+                    giveaway_info = f"**Reward:** {giveaway['reward']}\n**Participants:** {len(giveaway['participants'])}\n**Ends:** <t:{int(giveaway['end_time'].timestamp())}:R>\n**Message ID:** {message_id}"
+                    
+                    # Add required role info if present
+                    if giveaway.get('required_role_id'):
+                        role = interaction.guild.get_role(giveaway['required_role_id'])
+                        if role:
+                            giveaway_info += f"\n**Required Role:** {role.mention}"
+                    
                     embed.add_field(
                         name=f"Giveaway #{giveaway['id']}",
-                        value=f"**Reward:** {giveaway['reward']}\n**Participants:** {len(giveaway['participants'])}\n**Ends:** <t:{int(giveaway['end_time'].timestamp())}:R>\n**Message ID:** {message_id}",
+                        value=giveaway_info,
                         inline=False
                     )
         
@@ -510,12 +577,251 @@ async def list_giveaways_command(interaction: discord.Interaction):
             await interaction.followup.send(embed=embed, ephemeral=True)
         
     except Exception as e:
-        print(f"Error in list_giveaways command: {e}")
-        await interaction.followup.send("❌ An error occurred while listing giveaways.", ephemeral=True)
- 
- # ------------------------------------------------------------------
- # 6.  Giveaway functions
- # ------------------------------------------------------------------
+         print(f"Error in list_giveaways command: {e}")
+         await interaction.followup.send("❌ An error occurred while listing giveaways.", ephemeral=True)
+
+@bot.tree.command(
+    name="invites",
+    description="Check your invite statistics or another user's invites"
+)
+async def invites_command(
+    interaction: discord.Interaction,
+    user: discord.Member = None
+):
+    """Slash command to check invite statistics"""
+    try:
+        await interaction.response.defer()
+        
+        target_user = user or interaction.user
+        user_id = target_user.id
+        
+        # Get user's invite data
+        user_invites = invite_data.get(user_id, {
+            'invites': 0,
+            'joins': 0,
+            'left': 0,
+            'fake': 0
+        })
+        
+        # Calculate real invites (joins - left - fake)
+        real_invites = user_invites['joins'] - user_invites['left'] - user_invites['fake']
+        
+        embed = discord.Embed(
+            title=f"📊 Invite Statistics for {target_user.display_name}",
+            color=0x00ff00
+        )
+        
+        embed.add_field(
+            name="📨 Total Invites Created",
+            value=str(user_invites['invites']),
+            inline=True
+        )
+        
+        embed.add_field(
+            name="✅ Successful Joins",
+            value=str(user_invites['joins']),
+            inline=True
+        )
+        
+        embed.add_field(
+            name="📈 Real Invites",
+            value=str(max(0, real_invites)),
+            inline=True
+        )
+        
+        embed.add_field(
+            name="❌ Members Left",
+            value=str(user_invites['left']),
+            inline=True
+        )
+        
+        embed.add_field(
+            name="🚫 Fake/Invalid",
+            value=str(user_invites['fake']),
+            inline=True
+        )
+        
+        embed.set_thumbnail(url=target_user.display_avatar.url)
+        embed.set_footer(text="Invite tracking system")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in invites command: {e}")
+        embed = discord.Embed(
+            title="❌ Error",
+            description="An error occurred while fetching invite statistics.",
+            color=0xff0000
+        )
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except:
+            pass
+
+@bot.tree.command(
+    name="leaderboard",
+    description="Show the top inviters in the server"
+)
+async def leaderboard_command(interaction: discord.Interaction):
+    """Slash command to show invite leaderboard"""
+    try:
+        await interaction.response.defer()
+        
+        if not invite_data:
+            await interaction.followup.send("📭 No invite data available yet.", ephemeral=True)
+            return
+        
+        # Sort users by real invites (joins - left - fake)
+        sorted_users = []
+        for user_id, data in invite_data.items():
+            real_invites = data['joins'] - data['left'] - data['fake']
+            if real_invites > 0:
+                sorted_users.append((user_id, real_invites, data))
+        
+        sorted_users.sort(key=lambda x: x[1], reverse=True)
+        
+        if not sorted_users:
+            await interaction.followup.send("📭 No users with successful invites yet.", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title="🏆 Invite Leaderboard",
+            description="Top inviters in the server",
+            color=0xffd700
+        )
+        
+        # Show top 10
+        for i, (user_id, real_invites, data) in enumerate(sorted_users[:10]):
+            user = bot.get_user(user_id)
+            username = user.display_name if user else f"Unknown User ({user_id})"
+            
+            medal = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else f"{i+1}."
+            
+            embed.add_field(
+                name=f"{medal} {username}",
+                value=f"**{real_invites}** real invites\n({data['joins']} joins, {data['left']} left)",
+                inline=False
+            )
+        
+        embed.set_footer(text="Real invites = Joins - Left - Fake")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in leaderboard command: {e}")
+        embed = discord.Embed(
+            title="❌ Error",
+            description="An error occurred while fetching the leaderboard.",
+            color=0xff0000
+        )
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except:
+            pass
+
+@bot.tree.command(
+    name="reset_invites",
+    description="Reset invite statistics for a user (Admin only)"
+)
+async def reset_invites_command(
+    interaction: discord.Interaction,
+    user: discord.Member
+):
+    """Slash command to reset invite statistics"""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Check if user has the required role
+        required_role_id = config.get('permissions', {}).get('invite_admin_role_id')
+        
+        if not required_role_id or required_role_id == "YOUR_ROLE_ID_HERE":
+            await interaction.followup.send("❌ Reset invites command is not configured. Please set the invite_admin_role_id in config.yml", ephemeral=True)
+            return
+        
+        # Check if user has the required role
+        user_role_ids = [str(role.id) for role in interaction.user.roles]
+        if required_role_id not in user_role_ids:
+            await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+        
+        user_id = user.id
+        
+        if user_id in invite_data:
+            del invite_data[user_id]
+            await interaction.followup.send(f"✅ Reset invite statistics for {user.display_name}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ No invite data found for {user.display_name}", ephemeral=True)
+        
+    except Exception as e:
+        print(f"Error in reset_invites command: {e}")
+        await interaction.followup.send("❌ An error occurred while resetting invite statistics.", ephemeral=True)
+  
+  # ------------------------------------------------------------------
+  # 6.  Invite tracking functions
+  # ------------------------------------------------------------------
+
+async def update_invite_cache(guild):
+    """Update the invite cache for a guild"""
+    try:
+        invites = await guild.invites()
+        guild_invites[guild.id] = {}
+        
+        for invite in invites:
+            if invite.inviter:
+                guild_invites[guild.id][invite.code] = {
+                    'inviter_id': invite.inviter.id,
+                    'uses': invite.uses or 0
+                }
+                
+                # Initialize invite data for the inviter
+                if invite.inviter.id not in invite_data:
+                    invite_data[invite.inviter.id] = {
+                        'invites': 0,
+                        'joins': 0,
+                        'left': 0,
+                        'fake': 0
+                    }
+                
+                # Count total invites created
+                invite_data[invite.inviter.id]['invites'] = len([i for i in invites if i.inviter and i.inviter.id == invite.inviter.id])
+        
+        print(f"Updated invite cache for {guild.name}: {len(guild_invites[guild.id])} invites")
+        
+    except Exception as e:
+        print(f"Error updating invite cache: {e}")
+
+async def find_invite_used(guild, member):
+    """Find which invite was used by comparing before/after"""
+    try:
+        current_invites = await guild.invites()
+        
+        if guild.id not in guild_invites:
+            await update_invite_cache(guild)
+            return None
+        
+        old_invites = guild_invites[guild.id]
+        
+        for invite in current_invites:
+            if invite.code in old_invites:
+                old_uses = old_invites[invite.code]['uses']
+                if invite.uses > old_uses:
+                    # This invite was used
+                    inviter_id = old_invites[invite.code]['inviter_id']
+                    
+                    # Update cache
+                    guild_invites[guild.id][invite.code]['uses'] = invite.uses
+                    
+                    return inviter_id
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error finding used invite: {e}")
+        return None
+
+  # ------------------------------------------------------------------
+  # 7.  Giveaway functions
+  # ------------------------------------------------------------------
 
 @bot.event
 async def on_reaction_add(reaction, user):
@@ -534,11 +840,150 @@ async def on_reaction_add(reaction, user):
         
         # Check if reaction is the giveaway emoji
         if str(reaction.emoji) == "🎉":
+            # Check if giveaway has a required role
+            if giveaway.get('required_role_id'):
+                # Check if user has the required role
+                member = reaction.message.guild.get_member(user.id)
+                if not member or not any(role.id == giveaway['required_role_id'] for role in member.roles):
+                    # Remove the reaction since user doesn't have required role
+                    try:
+                        await reaction.remove(user)
+                    except:
+                        pass
+                    return
+            
             # Add user to participants
             giveaway['participants'].add(user.id)
             
             # Update the embed with new participant count
             await update_giveaway_embed(reaction.message, giveaway)
+
+@bot.event
+async def on_member_join(member):
+    """Handle member joins and track invite usage"""
+    try:
+        guild = member.guild
+        
+        # Find which invite was used
+        inviter_id = await find_invite_used(guild, member)
+        
+        if inviter_id:
+            # Initialize invite data if not exists
+            if inviter_id not in invite_data:
+                invite_data[inviter_id] = {
+                    'invites': 0,
+                    'joins': 0,
+                    'left': 0,
+                    'fake': 0
+                }
+            
+            # Check if this might be a fake account
+            account_age = (datetime.now(timezone.utc) - member.created_at).days
+            fake_threshold = config.get('invite_tracking', {}).get('fake_account_threshold_days', 7)
+            is_fake = account_age < fake_threshold
+            
+            if is_fake:
+                invite_data[inviter_id]['fake'] += 1
+                print(f"Detected potential fake account: {member.name} (age: {account_age} days) invited by {inviter_id}")
+            else:
+                invite_data[inviter_id]['joins'] += 1
+                print(f"Member {member.name} joined using invite from {inviter_id}")
+            
+            # Save invite data
+            save_invite_data()
+            
+            # Update invite cache
+            await update_invite_cache(guild)
+            
+            # Send notification if configured
+            invite_config = config.get('invite_tracking', {})
+            if invite_config.get('enabled', False) and 'invite_log_channel_id' in invite_config:
+                channel = bot.get_channel(int(invite_config['invite_log_channel_id']))
+            else:
+                channel = None
+            if channel and not is_fake:
+                inviter = bot.get_user(inviter_id)
+                inviter_name = inviter.display_name if inviter else f"User {inviter_id}"
+                
+                embed = discord.Embed(
+                    title="👋 New Member Joined!",
+                    description=f"**{member.mention}** joined the server\nInvited by: **{inviter_name}**",
+                    color=0x00ff00,
+                    timestamp=datetime.now(timezone.utc)
+                )
+                embed.set_thumbnail(url=member.display_avatar.url)
+                embed.set_footer(text="Invite tracking system")
+                
+                try:
+                    await channel.send(embed=embed)
+                except:
+                    pass  # Don't fail if we can't send to channel
+        else:
+            print(f"Could not determine invite used by {member.name}")
+            # Update cache anyway
+            await update_invite_cache(guild)
+            
+    except Exception as e:
+        print(f"Error in on_member_join: {e}")
+
+@bot.event
+async def on_member_remove(member):
+    """Handle member leaves and update invite statistics"""
+    try:
+        # Find who invited this member by checking our records
+        # This is a simplified approach - in a production bot you'd want to store this data
+        
+        # For now, we'll just update the cache and log the leave
+        print(f"Member {member.name} left the server")
+        
+        # Update invite cache
+        await update_invite_cache(member.guild)
+        
+        # Save invite data
+        save_invite_data()
+        
+        # Send notification if configured
+        invite_config = config.get('invite_tracking', {})
+        if invite_config.get('enabled', False) and 'invite_log_channel_id' in invite_config:
+            channel = bot.get_channel(int(invite_config['invite_log_channel_id']))
+        else:
+            channel = None
+        if channel:
+            embed = discord.Embed(
+                title="👋 Member Left",
+                description=f"**{member.display_name}** left the server",
+                color=0xff6b6b,
+                timestamp=datetime.now(timezone.utc)
+            )
+            embed.set_thumbnail(url=member.display_avatar.url)
+            embed.set_footer(text="Invite tracking system")
+            
+            try:
+                await channel.send(embed=embed)
+            except:
+                pass  # Don't fail if we can't send to channel
+                
+    except Exception as e:
+        print(f"Error in on_member_remove: {e}")
+
+@bot.event
+async def on_invite_create(invite):
+    """Handle new invite creation"""
+    try:
+        if invite.inviter:
+            print(f"New invite created by {invite.inviter.name}: {invite.code}")
+            await update_invite_cache(invite.guild)
+    except Exception as e:
+        print(f"Error in on_invite_create: {e}")
+
+@bot.event
+async def on_invite_delete(invite):
+    """Handle invite deletion"""
+    try:
+        print(f"Invite deleted: {invite.code}")
+        await update_invite_cache(invite.guild)
+    except Exception as e:
+        print(f"Error in on_invite_delete: {e}")
 
 @bot.event
 async def on_reaction_remove(reaction, user):
@@ -653,6 +1098,11 @@ async def check_giveaways():
     
     for message_id in expired_giveaways:
         await end_giveaway(message_id)
+
+@tasks.loop(minutes=5)
+async def save_invite_data_periodic():
+    """Save invite data every 5 minutes"""
+    save_invite_data()
 
 # ------------------------------------------------------------------
 # 7.  HTTP polling listener
@@ -849,10 +1299,29 @@ async def on_ready():
     else:
         print(f"WARNING: Could not find channel with ID {CID}")
     
+    # Initialize invite cache for all guilds (only if invite tracking is enabled)
+    invite_config = config.get('invite_tracking', {})
+    if invite_config.get('enabled', False):
+        for guild in bot.guilds:
+            try:
+                await update_invite_cache(guild)
+                print(f"Initialized invite cache for {guild.name}")
+            except discord.Forbidden:
+                print(f"Missing permissions to access invites for {guild.name}. Enable 'Manage Server' permission.")
+            except Exception as e:
+                print(f"Failed to initialize invite cache for {guild.name}: {e}")
+    else:
+        print("Invite tracking is disabled, skipping invite cache initialization")
+    
     # Start giveaway checker
     if not check_giveaways.is_running():
         check_giveaways.start()
         print("Started giveaway checker task")
+    
+    # Start periodic invite data saving
+    if not save_invite_data_periodic.is_running():
+        save_invite_data_periodic.start()
+        print("Started periodic invite data saving task")
     
     # Sync slash commands
     try:
